@@ -413,6 +413,77 @@ describe('toNodeHandler', () => {
 
         expect(() => toNodeHandler({ fetch }, { maxRequestBodySize: 0 })).toThrow(RangeError);
     });
+
+    it('releases an idle response stream as soon as the client disconnects', async () => {
+        // A response stream that has nothing to read is the SSE shape: the
+        // transport only writes on a keep-alive interval (15s by default), so a
+        // pull loop parked in `read()` cannot notice the client is gone until
+        // the next chunk arrives — keeping the session's stream registered, and
+        // every reconnect answered `409`, for that whole interval.
+        let cancelled = false;
+        const stream = new ReadableStream<Uint8Array>({
+            start(controller) {
+                controller.enqueue(new TextEncoder().encode('event: endpoint\ndata: /mcp\n\n'));
+            },
+            cancel() {
+                cancelled = true;
+            }
+        });
+        const fetch = vi.fn(async () => new Response(stream, { status: 200, headers: { 'content-type': 'text/event-stream' } }));
+
+        const listeners = new Map<string, (() => void)[]>();
+        let ended = false;
+        const res: FakeNodeResponse = {
+            statusCode: 0,
+            headers: undefined,
+            writeHead(statusCode: number, headers?: Record<string, string>) {
+                this.statusCode = statusCode;
+                this.headers = headers;
+                return this;
+            },
+            write() {
+                return true;
+            },
+            end() {
+                ended = true;
+                return this;
+            },
+            on(event: string, listener: (...args: unknown[]) => void) {
+                listeners.set(event, [...(listeners.get(event) ?? []), listener as () => void]);
+                return this;
+            }
+        };
+
+        const done = toNodeHandler({ fetch })(
+            {
+                [Symbol.asyncIterator]: () => ({ next: async () => ({ done: true as const, value: undefined }) }),
+                method: 'GET',
+                url: '/mcp',
+                headers: { host: 'localhost' }
+            },
+            res
+        );
+        await vi.waitFor(() => expect(res.statusCode).toBe(200));
+        // The endpoint event has been written; the stream is now idle.
+        expect(fetch).toHaveBeenCalledTimes(1);
+        expect(ended).toBe(false);
+        expect(cancelled).toBe(false);
+
+        // The client's GET connection drops.
+        for (const listener of listeners.get('close') ?? []) {
+            listener();
+        }
+
+        // Before the stream is cancelled this only settles on the next chunk,
+        // which an idle keep-alive stream never sends.
+        const outcome = await Promise.race([
+            done.then(() => 'settled' as const),
+            new Promise<'timeout'>(resolve => setTimeout(() => resolve('timeout'), 100))
+        ]);
+        expect(outcome).toBe('settled');
+        expect(cancelled).toBe(true);
+        expect(ended).toBe(true);
+    });
 });
 
 /* ------------------------------------------------------------------------ *

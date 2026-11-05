@@ -199,12 +199,32 @@ export function toNodeHandler(handler: FetchLikeMcpHandler, opts?: ToNodeHandler
         const closed = new Promise<void>(resolve => {
             abort.signal.addEventListener('abort', () => resolve(), { once: true });
         });
+        // An idle response stream parks the pull loop inside `read()`, where the
+        // post-chunk abort check can never run: nothing cancels the upstream
+        // stream until the next chunk arrives, so a stream that only writes on a
+        // keep-alive interval (SSE, where the default interval is 15s) stays
+        // registered — and its session keeps answering 409 to a reconnect —
+        // for the whole interval after the client is gone. Cancelling the
+        // reader on abort releases it immediately: the pending `read()`
+        // resolves `done` and the loop exits.
+        const reader = response.body.getReader();
+        const cancelReader = () => {
+            void reader.cancel().catch(() => {
+                // A stream that already errored has nothing left to cancel.
+            });
+        };
+        if (abort.signal.aborted) {
+            cancelReader();
+        } else {
+            abort.signal.addEventListener('abort', cancelReader, { once: true });
+        }
         try {
-            for await (const chunk of response.body) {
-                if (abort.signal.aborted) {
+            for (;;) {
+                const result = await reader.read();
+                if (result.done || abort.signal.aborted) {
                     break;
                 }
-                if (res.write(chunk) === false) {
+                if (res.write(result.value) === false) {
                     await Promise.race([
                         new Promise<void>(resolve => {
                             drainResolve = resolve;
@@ -215,6 +235,8 @@ export function toNodeHandler(handler: FetchLikeMcpHandler, opts?: ToNodeHandler
             }
         } catch {
             // Stream aborted upstream; the abort signal already cancelled the exchange.
+        } finally {
+            abort.signal.removeEventListener('abort', cancelReader);
         }
         finished = true;
         res.end();
